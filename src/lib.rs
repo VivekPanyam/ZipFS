@@ -8,7 +8,6 @@ use lunchbox::types::{
 use lunchbox::{types::PathType, ReadableFileSystem};
 use pin_project::pin_project;
 use std::io::{ErrorKind, Result};
-use std::marker::PhantomData;
 use std::sync::Arc;
 use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek};
@@ -16,25 +15,30 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek};
 /// In order to open and read multiple files simultaneously, we need multiple AsyncRead + AsyncSeek streams for the
 /// zip file. Note that `clone` generally doesn't work because we need independent reads and seeks across the
 /// streams
-pub trait GetReader<T> {
-    fn get(&self) -> T;
+pub trait GetReader {
+    type R: AsyncRead + AsyncSeek + Unpin;
+
+    fn get(&self) -> Self::R;
 }
 
 // Internally, we wrap a `GetReader` and implement Clone on it to pass to the zip file library
 #[pin_project]
-struct Wrapper<T, U> {
+struct Wrapper<T>
+where
+    T: GetReader,
+{
     #[pin]
-    inner: T,
+    inner: T::R,
 
     // Used to get new readers when we clone
-    factory: Arc<U>,
+    factory: Arc<T>,
 }
 
-impl<T, U> Wrapper<T, U>
+impl<T> Wrapper<T>
 where
-    U: GetReader<T>,
+    T: GetReader,
 {
-    fn new(factory: Arc<U>) -> Self {
+    fn new(factory: Arc<T>) -> Self {
         Self {
             inner: factory.get(),
             factory,
@@ -42,9 +46,9 @@ where
     }
 }
 
-impl<T, U> Clone for Wrapper<T, U>
+impl<T> Clone for Wrapper<T>
 where
-    U: GetReader<T>,
+    T: GetReader,
 {
     fn clone(&self) -> Self {
         Self::new(self.factory.clone())
@@ -52,9 +56,9 @@ where
 }
 
 // Pass through AsyncRead
-impl<T, U> AsyncRead for Wrapper<T, U>
+impl<T> AsyncRead for Wrapper<T>
 where
-    T: AsyncRead,
+    T: GetReader,
 {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
@@ -66,9 +70,9 @@ where
 }
 
 // Pass through AsyncSeek
-impl<T, U> AsyncSeek for Wrapper<T, U>
+impl<T> AsyncSeek for Wrapper<T>
 where
-    T: AsyncSeek,
+    T: GetReader,
 {
     fn start_seek(
         self: std::pin::Pin<&mut Self>,
@@ -85,22 +89,19 @@ where
     }
 }
 
-pub struct ZipFS<'a, R, U>
+pub struct ZipFS<T>
 where
-    R: AsyncRead + AsyncSeek + Unpin,
-    U: GetReader<R>,
+    T: GetReader,
 {
-    zip: ZipFileReader<Wrapper<R, U>>,
+    zip: ZipFileReader<Wrapper<T>>,
     entries: Vec<ZipEntry>,
-    pd: PhantomData<&'a ()>,
 }
 
-impl<'a, R, U> ZipFS<'a, R, U>
+impl<T> ZipFS<T>
 where
-    R: 'a + AsyncRead + AsyncSeek + Unpin + Sync,
-    U: GetReader<R>,
+    T: GetReader,
 {
-    pub async fn new(factory: U) -> ZipFS<'a, R, U> {
+    pub async fn new(factory: T) -> ZipFS<T> {
         let wrapper = Wrapper::new(Arc::new(factory));
 
         let zip = ZipFileReader::new(wrapper).await.unwrap();
@@ -113,11 +114,7 @@ where
             .map(|e| e.entry().clone())
             .collect();
 
-        Self {
-            zip,
-            entries,
-            pd: PhantomData,
-        }
+        Self { zip, entries }
     }
 }
 
@@ -125,21 +122,20 @@ where
 // the `ReadableFile` trait for it. The orphan rules prevent doing this so we need to
 // wrap `ZipEntryReader` in our own type.
 #[pin_project]
-pub struct File<R, U>
+pub struct File<'a, T>
 where
-    R: AsyncRead + Unpin + 'static,
-    U: 'static,
+    T: GetReader,
 {
     entry: ZipEntry,
 
     #[pin]
-    inner: ZipEntryReader<'static, Wrapper<R, U>>,
+    inner: ZipEntryReader<'a, Wrapper<T>>,
 }
 
 // Pass reads through
-impl<R, U> AsyncRead for File<R, U>
+impl<'a, T> AsyncRead for File<'a, T>
 where
-    R: AsyncRead + Unpin,
+    T: GetReader,
 {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
@@ -151,10 +147,10 @@ where
 }
 
 #[async_trait]
-impl<R, U> ReadableFile for File<R, U>
+impl<'a, T> ReadableFile for File<'a, T>
 where
-    R: AsyncRead + Unpin + Sync,
-    U: Sync + Send,
+    T: GetReader + Sync + Send,
+    T::R: Sync,
 {
     async fn metadata(&self) -> Result<Metadata> {
         let entry = &self.entry;
@@ -209,19 +205,18 @@ where
     }
 }
 
-impl<'a, R, U> HasFileType for ZipFS<'a, R, U>
+impl<T> HasFileType for ZipFS<T>
 where
-    R: 'a + AsyncRead + AsyncSeek + Unpin + Sync + 'static,
-    U: 'a + GetReader<R> + 'static,
+    T: GetReader + 'static,
 {
-    type FileType = File<R, U>;
+    type FileType = File<'static, T>;
 }
 
 #[async_trait]
-impl<'a, R, U> ReadableFileSystem for ZipFS<'a, R, U>
+impl<T> ReadableFileSystem for ZipFS<T>
 where
-    R: 'a + AsyncRead + AsyncSeek + Unpin + Sync + Send + 'static,
-    U: 'a + Sync + Send + GetReader<R> + 'static,
+    T: GetReader + 'static + Sync + Send,
+    T::R: Sync + Send,
 {
     async fn open(&self, path: impl PathType) -> Result<Self::FileType>
     where
@@ -318,17 +313,16 @@ pub struct ZipReadDirPoller {
     entries: Vec<PathBuf>,
 }
 
-impl<'b, R, U> ReadDirPoller<ZipFS<'b, R, U>> for ZipReadDirPoller
+impl<T> ReadDirPoller<ZipFS<T>> for ZipReadDirPoller
 where
-    R: 'b + AsyncRead + AsyncSeek + Unpin + Sync + Send + 'static,
-    U: 'b + Sync + Send + GetReader<R> + 'static,
+    T: GetReader + 'static + Sync + Send,
+    T::R: Sync + Send,
 {
     fn poll_next_entry<'a>(
         &mut self,
         _cx: &mut std::task::Context<'_>,
-        fs: &'a ZipFS<'b, R, U>,
-    ) -> std::task::Poll<std::io::Result<Option<lunchbox::types::DirEntry<'a, ZipFS<'b, R, U>>>>>
-    {
+        fs: &'a ZipFS<T>,
+    ) -> std::task::Poll<std::io::Result<Option<lunchbox::types::DirEntry<'a, ZipFS<T>>>>> {
         match self.entries.pop() {
             Some(path) => {
                 let file_name = path.file_name().unwrap().into();
