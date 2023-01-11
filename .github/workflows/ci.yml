@@ -28,10 +28,7 @@ jobs:
     strategy:
       matrix:
         target:
-          # WASI builds don't currently work because zstd doesn't correctly build
-          # I put up a PR to fix it https://github.com/gyscos/zstd-rs/pull/183. Once a new version of zstd
-          # is released, we can update the dependency in `async_compression`, and then enable this build
-          # - wasm32-wasi
+          - wasm32-wasi
           - wasm32-unknown-unknown
     steps:
       - uses: actions/checkout@v3
