@@ -8,92 +8,25 @@ use lunchbox::types::{
 use lunchbox::{types::PathType, ReadableFileSystem};
 use pin_project::pin_project;
 use std::io::{ErrorKind, Result};
-use std::sync::Arc;
 use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek};
 
 /// In order to open and read multiple files simultaneously, we need multiple AsyncRead + AsyncSeek streams for the
 /// zip file. Note that `clone` generally doesn't work because we need independent reads and seeks across the
 /// streams
+#[async_trait]
 pub trait GetReader {
     type R: AsyncRead + AsyncSeek + Unpin;
 
-    fn get(&self) -> Self::R;
-}
-
-// Internally, we wrap a `GetReader` and implement Clone on it to pass to the zip file library
-#[pin_project]
-struct Wrapper<T>
-where
-    T: GetReader,
-{
-    #[pin]
-    inner: T::R,
-
-    // Used to get new readers when we clone
-    factory: Arc<T>,
-}
-
-impl<T> Wrapper<T>
-where
-    T: GetReader,
-{
-    fn new(factory: Arc<T>) -> Self {
-        Self {
-            inner: factory.get(),
-            factory,
-        }
-    }
-}
-
-impl<T> Clone for Wrapper<T>
-where
-    T: GetReader,
-{
-    fn clone(&self) -> Self {
-        Self::new(self.factory.clone())
-    }
-}
-
-// Pass through AsyncRead
-impl<T> AsyncRead for Wrapper<T>
-where
-    T: GetReader,
-{
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        self.project().inner.poll_read(cx, buf)
-    }
-}
-
-// Pass through AsyncSeek
-impl<T> AsyncSeek for Wrapper<T>
-where
-    T: GetReader,
-{
-    fn start_seek(
-        self: std::pin::Pin<&mut Self>,
-        position: std::io::SeekFrom,
-    ) -> std::io::Result<()> {
-        self.project().inner.start_seek(position)
-    }
-
-    fn poll_complete(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<u64>> {
-        self.project().inner.poll_complete(cx)
-    }
+    async fn get(&self) -> Self::R;
 }
 
 pub struct ZipFS<T>
 where
     T: GetReader,
 {
-    zip: ZipFileReader<Wrapper<T>>,
+    factory: T,
+    zip_info: async_zip::ZipFile,
     entries: Vec<ZipEntry>,
 }
 
@@ -102,9 +35,7 @@ where
     T: GetReader,
 {
     pub async fn new(factory: T) -> ZipFS<T> {
-        let wrapper = Wrapper::new(Arc::new(factory));
-
-        let zip = ZipFileReader::new(wrapper).await.unwrap();
+        let zip = ZipFileReader::new(factory.get().await).await.unwrap();
 
         // This makes a copy of each entry, but that's probably ok
         let entries = zip
@@ -114,7 +45,11 @@ where
             .map(|e| e.entry().clone())
             .collect();
 
-        Self { zip, entries }
+        Self {
+            factory,
+            zip_info: zip.file().clone(),
+            entries,
+        }
     }
 }
 
@@ -122,20 +57,17 @@ where
 // the `ReadableFile` trait for it. The orphan rules prevent doing this so we need to
 // wrap `ZipEntryReader` in our own type.
 #[pin_project]
-pub struct File<'a, T>
-where
-    T: GetReader,
-{
+pub struct File<'a, R> {
     entry: ZipEntry,
 
     #[pin]
-    inner: ZipEntryReader<'a, Wrapper<T>>,
+    inner: ZipEntryReader<'a, R>,
 }
 
 // Pass reads through
-impl<'a, T> AsyncRead for File<'a, T>
+impl<'a, R> AsyncRead for File<'a, R>
 where
-    T: GetReader,
+    R: AsyncRead + Unpin,
 {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
@@ -147,10 +79,9 @@ where
 }
 
 #[async_trait]
-impl<'a, T> ReadableFile for File<'a, T>
+impl<'a, R> ReadableFile for File<'a, R>
 where
-    T: GetReader + Sync + Send,
-    T::R: Sync,
+    R: AsyncRead + Unpin + Sync,
 {
     async fn metadata(&self) -> Result<Metadata> {
         let entry = &self.entry;
@@ -209,7 +140,7 @@ impl<T> HasFileType for ZipFS<T>
 where
     T: GetReader + 'static,
 {
-    type FileType = File<'static, T>;
+    type FileType = File<'static, T::R>;
 }
 
 #[async_trait]
@@ -236,11 +167,11 @@ where
             None => return Err(std::io::Error::new(ErrorKind::NotFound, "File not found")),
         };
 
-        // The underlying reader needs to be clonable (with independent seeking) in order to support opening
-        // and reading multiple files within the zip at the same time
-        // We clone the ZipFileReader here because that'll clone the wrapper and get a new underlying reader (see GetReader)
-        // We turn that into an entry reader and return that as a file
-        let inner = self.zip.clone().into_entry(entry_idx).await.unwrap();
+        // Create a new ZipFileReader
+        let zip = ZipFileReader::from_parts(self.factory.get().await, self.zip_info.clone());
+
+        // Turn it into an entry reader
+        let inner = zip.into_entry(entry_idx).await.unwrap();
 
         Ok(File {
             inner,

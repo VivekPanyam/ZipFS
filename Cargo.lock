@@ -46,7 +46,7 @@ dependencies = [
 [[package]]
 name = "async_zip"
 version = "0.0.9"
-source = "git+https://github.com/VivekPanyam/rs-async-zip?branch=all_fixes#bd91e54603479c5f69e40b5008d9e6242943b029"
+source = "git+https://github.com/VivekPanyam/rs-async-zip?branch=from_parts#060a8f062f789b0dd99664c5279824f5657b97b2"
 dependencies = [
  "async-compression",
  "chrono",
