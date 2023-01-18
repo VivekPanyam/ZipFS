@@ -45,13 +45,14 @@ dependencies = [
 
 [[package]]
 name = "async_zip"
-version = "0.0.10"
+version = "0.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5282f208287c58b7df1f7965531a49192eb4a22558fa1421d26d1a7c6118613"
+checksum = "c50d29ab7e2f9e808cca1a69ea56a36f4ff216f54a41a23aae1fd4afc05cc020"
 dependencies = [
  "async-compression",
  "chrono",
  "crc32fast",
+ "log",
  "pin-project",
  "thiserror",
  "tokio",
@@ -255,9 +256,9 @@ dependencies = [
 
 [[package]]
 name = "lunchbox"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e220c2406aa4217cc4df33c6b74b1f97dfaf1faed1f153efbf1041d8c3f9c02"
+checksum = "53fb55d452bf54846bf040847126c25ac29b67d41e39620e8c16eefdaddbca0f"
 dependencies = [
  "async-trait",
  "path-clean",

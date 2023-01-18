@@ -1,9 +1,10 @@
 use async_trait::async_trait;
-use async_zip::read::seek::{ZipEntryReader, ZipFileReader};
-use async_zip::ZipEntry;
+use async_zip::read::ZipEntryReader;
+use async_zip::read::seek::ZipFileReader;
+use async_zip::{ZipEntry, AttributeCompatibility};
 use lunchbox::path::PathBuf;
 use lunchbox::types::{
-    DirEntry, FileType, HasFileType, Metadata, Permissions, ReadDir, ReadDirPoller, ReadableFile,
+    DirEntry, FileType, HasFileType, Metadata, Permissions, ReadDir, ReadDirPoller, ReadableFile, MaybeSend, MaybeSync,
 };
 use lunchbox::{types::PathType, ReadableFileSystem};
 use pin_project::pin_project;
@@ -14,7 +15,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek};
 /// In order to open and read multiple files simultaneously, we need multiple AsyncRead + AsyncSeek streams for the
 /// zip file. Note that `clone` generally doesn't work because we need independent reads and seeks across the
 /// streams
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 pub trait GetReader {
     type R: AsyncRead + AsyncSeek + Unpin;
 
@@ -78,10 +80,11 @@ where
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl<'a, R> ReadableFile for File<'a, R>
 where
-    R: AsyncRead + Unpin + Sync,
+    R: AsyncRead + Unpin + MaybeSync,
 {
     async fn metadata(&self) -> Result<Metadata> {
         let entry = &self.entry;
@@ -143,11 +146,12 @@ where
     type FileType = File<'static, T::R>;
 }
 
-#[async_trait]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl<T> ReadableFileSystem for ZipFS<T>
 where
-    T: GetReader + 'static + Sync + Send,
-    T::R: Sync + Send,
+    T: GetReader + 'static + MaybeSync + MaybeSend,
+    T::R: MaybeSync + MaybeSend,
 {
     async fn open(&self, path: impl PathType) -> Result<Self::FileType>
     where
@@ -246,8 +250,8 @@ pub struct ZipReadDirPoller {
 
 impl<T> ReadDirPoller<ZipFS<T>> for ZipReadDirPoller
 where
-    T: GetReader + 'static + Sync + Send,
-    T::R: Sync + Send,
+    T: GetReader + 'static + MaybeSync + MaybeSend,
+    T::R: MaybeSync + MaybeSend,
 {
     fn poll_next_entry<'a>(
         &mut self,
