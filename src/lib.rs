@@ -1,10 +1,11 @@
 use async_trait::async_trait;
-use async_zip::read::ZipEntryReader;
 use async_zip::read::seek::ZipFileReader;
-use async_zip::{ZipEntry, AttributeCompatibility};
+use async_zip::read::ZipEntryReader;
+use async_zip::{AttributeCompatibility, ZipEntry};
 use lunchbox::path::PathBuf;
 use lunchbox::types::{
-    DirEntry, FileType, HasFileType, Metadata, Permissions, ReadDir, ReadDirPoller, ReadableFile, MaybeSend, MaybeSync,
+    DirEntry, FileType, HasFileType, MaybeSend, MaybeSync, Metadata, Permissions, ReadDir,
+    ReadDirPoller, ReadableFile,
 };
 use lunchbox::{types::PathType, ReadableFileSystem};
 use pin_project::pin_project;
