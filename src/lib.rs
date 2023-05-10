@@ -112,7 +112,13 @@ where
         ));
 
         // Get the modified time from the zipfile
-        let modified = Ok((entry.last_modification_date().as_chrono().single().unwrap()).into());
+        let modified = match entry.last_modification_date().as_chrono().single() {
+            Some(v) => Ok(v.into()),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "No modification time available",
+            )),
+        };
 
         // Finally, len is the uncompressed size
         let len = entry.uncompressed_size();
@@ -169,7 +175,12 @@ where
 
         let (entry_idx, entry) = match found {
             Some(item) => item,
-            None => return Err(std::io::Error::new(ErrorKind::NotFound, "File not found")),
+            None => {
+                return Err(std::io::Error::new(
+                    ErrorKind::NotFound,
+                    format!("File not found in zipfile: {path}"),
+                ))
+            }
         };
 
         // Create a new ZipFileReader
