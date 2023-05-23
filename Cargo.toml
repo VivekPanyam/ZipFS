@@ -10,3 +10,6 @@ async-trait = "0.1"
 async_zip = {version = "0.0.11", features = ["chrono", "deflate", "zstd"]}
 pin-project = "1"
 path-clean = "0.1"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { version = "1", features = ["io-util", "fs"] }

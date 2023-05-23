@@ -24,6 +24,17 @@ pub trait GetReader {
     async fn get(&self) -> Self::R;
 }
 
+// Allow passing in local paths to the ZipFS constructor
+#[cfg(not(target_family = "wasm"))]
+#[async_trait]
+impl GetReader for std::path::PathBuf {
+    type R = tokio::fs::File;
+
+    async fn get(&self) -> Self::R {
+        tokio::fs::File::open(&self).await.unwrap()
+    }
+}
+
 pub struct ZipFS<T>
 where
     T: GetReader,
