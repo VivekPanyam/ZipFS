@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use async_zip::read::seek::ZipFileReader;
 use async_zip::read::ZipEntryReader;
-use async_zip::{AttributeCompatibility, ZipEntry};
+use async_zip::ZipEntry;
 use lunchbox::path::PathBuf;
 use lunchbox::types::{
     DirEntry, FileType, HasFileType, MaybeSend, MaybeSync, Metadata, Permissions, ReadDir,
