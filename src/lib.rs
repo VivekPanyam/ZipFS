@@ -17,7 +17,7 @@
 use async_trait::async_trait;
 use async_zip::read::seek::ZipFileReader;
 use async_zip::read::ZipEntryReader;
-use async_zip::ZipEntry;
+use async_zip::{AttributeCompatibility, ZipEntry};
 use lunchbox::path::PathBuf;
 use lunchbox::types::{
     DirEntry, FileType, HasFileType, MaybeSend, MaybeSync, Metadata, Permissions, ReadDir,
@@ -25,6 +25,7 @@ use lunchbox::types::{
 };
 use lunchbox::{types::PathType, ReadableFileSystem};
 use pin_project::pin_project;
+use std::collections::HashSet;
 use std::io::{ErrorKind, Result};
 use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek};
@@ -122,11 +123,19 @@ where
         // https://github.com/python/cpython/blob/820ef62833bd2d84a141adedd9a05998595d6b6d/Lib/zipfile.py#L528
         let is_dir = entry.filename().ends_with("/");
 
-        // We don't support symlinks yet
-        let is_symlink = false;
+        let is_symlink = if entry.attribute_compatibility() == AttributeCompatibility::Unix {
+            // The high two bytes of the external_file_attribute store st_mode
+            // https://unix.stackexchange.com/a/14727
+            let mode = entry.external_file_attribute() >> 16;
 
-        // Since we don't support symlinks, an entry is a file if it's not a dir
-        let is_file = !is_dir;
+            const S_IFLNK: u32 = 40960;
+            mode & S_IFLNK == S_IFLNK
+        } else {
+            false
+        };
+
+        // An entry is a file if it's not a dir or a symlink
+        let is_file = !is_dir && !is_symlink;
 
         // We don't have accessed or created
         let accessed = Err(std::io::Error::new(
@@ -180,19 +189,22 @@ where
     type FileType = File<'static, T::R>;
 }
 
-#[cfg_attr(target_family = "wasm", async_trait(?Send))]
-#[cfg_attr(not(target_family = "wasm"), async_trait)]
-impl<T> ReadableFileSystem for ZipFS<T>
+impl<T> ZipFS<T>
 where
     T: GetReader + 'static + MaybeSync + MaybeSend,
     T::R: MaybeSync + MaybeSend,
 {
-    async fn open(&self, path: impl PathType) -> Result<Self::FileType>
+    /// Opens a file without following symlinks
+    /// This means if `path` is a symlink, the returned file will be the symlink itself
+    async fn open_no_follow_symlink(
+        &self,
+        path: impl PathType,
+    ) -> Result<<ZipFS<T> as HasFileType>::FileType>
     where
-        Self::FileType: ReadableFile,
+        <ZipFS<T> as HasFileType>::FileType: ReadableFile,
     {
-        // Find the file we want to open
-        let path = self.canonicalize(path).await?;
+        // Normalize the path
+        let path: PathBuf = path_clean::clean(path.as_ref().as_str()).into();
 
         let found = self
             .entries
@@ -221,18 +233,81 @@ where
             entry: entry.clone(),
         })
     }
+}
+
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
+impl<T> ReadableFileSystem for ZipFS<T>
+where
+    T: GetReader + 'static + MaybeSync + MaybeSend,
+    T::R: MaybeSync + MaybeSend,
+{
+    async fn open(&self, path: impl PathType) -> Result<Self::FileType>
+    where
+        Self::FileType: ReadableFile,
+    {
+        // Find the file we want to open
+        let path = self.canonicalize(path).await?;
+
+        // Canonicalize follows the entire symlink chain so we can just call through to this
+        self.open_no_follow_symlink(&path).await
+    }
 
     async fn canonicalize(&self, path: impl PathType) -> Result<PathBuf> {
-        // We don't currently support symlinks so canonicalize and normailze are the same
-        Ok(path_clean::clean(path.as_ref().as_str()).into())
+        // We don't currently support directory symlinks. This means we only need to worry about the last
+        // component being a symlink. This means we can just open the file at `path` and keep following symlinks
+        // until we hit a target that isn't a symlink (or doesn't exist)
+        let mut path: PathBuf = path.as_ref().into();
+        let mut visited = HashSet::new();
+        loop {
+            // Normalize the path
+            path = path_clean::clean(path.as_str()).into();
+
+            // Return an error if we've already visited this path
+            if visited.contains(&path) {
+                return Err(std::io::Error::new(
+                    // TODO: use ErrorKind::FilesystemLoop once stable
+                    std::io::ErrorKind::Other,
+                    "Found symlink loop",
+                ));
+            }
+
+            // Track that we've seen the path
+            visited.insert(path.clone());
+
+            // Open the file and check if it's a symlink
+            let f = self.open_no_follow_symlink(&path).await;
+
+            // If the file doesn't exist, we can just return the path
+            if f.is_err() {
+                return Ok(path);
+            }
+
+            // Otherwise, grab metadata and check if it's a symlink
+            let mut f = f.unwrap();
+            let metadata = f.metadata().await?;
+            if metadata.is_symlink() {
+                // Read the target path and continue looping
+                let mut target = String::new();
+                f.read_to_string(&mut target).await?;
+
+                // Relative to the parent dir
+                path = path.parent().unwrap().join(target);
+            } else {
+                return Ok(path);
+            }
+        }
     }
 
     async fn metadata(&self, path: impl PathType) -> Result<Metadata> {
+        // Note: `open` follows the symlink chain (if any)
         self.open(path).await?.metadata().await
     }
 
     async fn read(&self, path: impl PathType) -> Result<Vec<u8>> {
         let mut v = Vec::new();
+
+        // Note: `open` follows the symlink chain (if any)
         let _ = self.open(path).await?.read_to_end(&mut v).await?;
         Ok(v)
     }
@@ -243,6 +318,7 @@ where
         &self,
         path: impl PathType,
     ) -> Result<ReadDir<Self::ReadDirPollerType, Self>> {
+        // We don't support directory symlinks yet so we don't have to do anything special here
         // Find all files within that directory
         let base_path = self.canonicalize(path).await?;
         let filtered = self
@@ -263,23 +339,35 @@ where
         Ok(ReadDir::new(poller, self))
     }
 
-    async fn read_link(&self, _path: impl PathType) -> Result<PathBuf> {
-        // We don't support symlinks for now
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "ZipFS does not currently support symlinks",
-        ))
+    async fn read_link(&self, path: impl PathType) -> Result<PathBuf> {
+        // Open the file and check if it's a symlink
+        let mut f = self.open_no_follow_symlink(path).await?;
+        let metadata = f.metadata().await?;
+        if metadata.is_symlink() {
+            // Read the target path
+            let mut path = String::new();
+            f.read_to_string(&mut path).await?;
+
+            // Note: we do not normalize the path here
+            Ok(path.into())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "File was not a symlink",
+            ))
+        }
     }
 
     async fn read_to_string(&self, path: impl PathType) -> Result<String> {
         let mut s = String::new();
+        // Note: `open` follows the symlink chain (if any)
         let _ = self.open(path).await?.read_to_string(&mut s).await?;
         Ok(s)
     }
 
     async fn symlink_metadata(&self, path: impl PathType) -> Result<Metadata> {
-        // We don't support symlinks yet so just pass through to metadata
-        self.metadata(path).await
+        // We don't want to follow symlink chains here
+        self.open_no_follow_symlink(path).await?.metadata().await
     }
 }
 
@@ -306,5 +394,85 @@ where
             // We're done reading entries
             None => Poll::Ready(Ok(None)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use lunchbox::{types::PathType, ReadableFileSystem};
+    use tokio::io::AsyncReadExt;
+
+    use crate::ZipFS;
+
+    fn get_test_data_dir() -> std::path::PathBuf {
+        let mut d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        d.push("test_data");
+        d
+    }
+
+    #[tokio::test]
+    async fn test_external_symlink() {
+        let zip = ZipFS::new(get_test_data_dir().join("external_symlink.zip")).await;
+
+        let symlink_target = zip.read_link("/symlink_to_etc_passwd").await.unwrap();
+        assert_eq!(symlink_target, "/etc/passwd");
+
+        assert!(zip.open("/symlink_to_etc_passwd").await.is_err())
+    }
+
+    async fn read_file(fs: &ZipFS<std::path::PathBuf>, path: impl PathType) -> String {
+        let mut str = String::new();
+        fs.open(path)
+            .await
+            .unwrap()
+            .read_to_string(&mut str)
+            .await
+            .unwrap();
+        str
+    }
+
+    #[tokio::test]
+    async fn test_symlinks() {
+        let zip = ZipFS::new(get_test_data_dir().join("symlink_test.zip")).await;
+
+        assert!(zip.metadata("a/a.txt").await.unwrap().is_file());
+        assert!(zip.symlink_metadata("a/a.txt").await.unwrap().is_file());
+        assert_eq!(zip.read_link("a/b.txt").await.unwrap(), "a.txt");
+        assert_eq!(zip.read_link("a/c.txt").await.unwrap(), "./a.txt");
+        assert_eq!(zip.read_link("a/d.txt").await.unwrap(), "../a/a.txt");
+        assert_eq!(
+            zip.read_link("b/c/symlink_to_a.txt").await.unwrap(),
+            "../../a/a.txt"
+        );
+
+        assert!(zip.metadata("b/c/d.txt").await.unwrap().is_file());
+        assert!(zip.symlink_metadata("b/c/d.txt").await.unwrap().is_file());
+        assert_eq!(
+            zip.read_link("symlink_to_d.txt").await.unwrap(),
+            "b/c/d.txt"
+        );
+        assert_eq!(
+            zip.read_link("/symlink_to_d.txt").await.unwrap(),
+            "b/c/d.txt"
+        );
+        assert_eq!(
+            zip.read_link("b/symlink_to_d.txt").await.unwrap(),
+            "c/d.txt"
+        );
+        assert_eq!(
+            zip.read_link("b/./symlink_to_d.txt").await.unwrap(),
+            "c/d.txt"
+        );
+
+        assert_eq!(read_file(&zip, "a/a.txt").await, "a");
+        assert_eq!(read_file(&zip, "a/b.txt").await, "a");
+        assert_eq!(read_file(&zip, "a/c.txt").await, "a");
+        assert_eq!(read_file(&zip, "a/d.txt").await, "a");
+        assert_eq!(read_file(&zip, "b/c/symlink_to_a.txt").await, "a");
+
+        assert_eq!(read_file(&zip, "b/c/d.txt").await, "d");
+        assert_eq!(read_file(&zip, "b/symlink_to_d.txt").await, "d");
+        assert_eq!(read_file(&zip, "symlink_to_d.txt").await, "d");
+        assert_eq!(read_file(&zip, "/symlink_to_d.txt").await, "d");
     }
 }
