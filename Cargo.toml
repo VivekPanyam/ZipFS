@@ -19,3 +19,6 @@ path-clean = "0.1"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokio = { version = "1", features = ["io-util", "fs"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
