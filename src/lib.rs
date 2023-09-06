@@ -15,8 +15,8 @@
 #![doc = include_str!("../README.md")]
 
 use async_trait::async_trait;
-use async_zip::read::seek::ZipFileReader;
-use async_zip::read::ZipEntryReader;
+use async_zip::base::read::seek::ZipFileReader;
+use async_zip::base::read::{WithoutEntry, ZipEntryReader};
 use async_zip::{AttributeCompatibility, ZipEntry};
 use lunchbox::path::PathBuf;
 use lunchbox::types::{
@@ -27,8 +27,10 @@ use lunchbox::{types::PathType, ReadableFileSystem};
 use pin_project::pin_project;
 use std::collections::HashSet;
 use std::io::{ErrorKind, Result};
+use std::ops::Deref;
 use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek};
+use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
 /// In order to open and read multiple files simultaneously, we need multiple AsyncRead + AsyncSeek streams for the
 /// zip file. Note that `clone` generally doesn't work because we need independent reads and seeks across the
@@ -66,14 +68,16 @@ where
     T: GetReader,
 {
     pub async fn new(factory: T) -> ZipFS<T> {
-        let zip = ZipFileReader::new(factory.get().await).await.unwrap();
+        let zip = ZipFileReader::new(factory.get().await.compat())
+            .await
+            .unwrap();
 
         // This makes a copy of each entry, but that's probably ok
         let entries = zip
             .file()
             .entries()
             .into_iter()
-            .map(|e| e.entry().clone())
+            .map(|e| e.deref().clone())
             .collect();
 
         Self {
@@ -88,15 +92,15 @@ where
 // the `ReadableFile` trait for it. The orphan rules prevent doing this so we need to
 // wrap `ZipEntryReader` in our own type.
 #[pin_project]
-pub struct File<'a, R> {
+pub struct File<R> {
     entry: ZipEntry,
 
     #[pin]
-    inner: ZipEntryReader<'a, R>,
+    inner: R,
 }
 
 // Pass reads through
-impl<'a, R> AsyncRead for File<'a, R>
+impl<R> AsyncRead for File<R>
 where
     R: AsyncRead + Unpin,
 {
@@ -111,7 +115,7 @@ where
 
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
 #[cfg_attr(not(target_family = "wasm"), async_trait)]
-impl<'a, R> ReadableFile for File<'a, R>
+impl<R> ReadableFile for File<R>
 where
     R: AsyncRead + Unpin + MaybeSync,
 {
@@ -121,7 +125,7 @@ where
         // A file is considered a directory if it ends in /
         // This is what python does as well
         // https://github.com/python/cpython/blob/820ef62833bd2d84a141adedd9a05998595d6b6d/Lib/zipfile.py#L528
-        let is_dir = entry.filename().ends_with("/");
+        let is_dir = entry.filename().as_str().unwrap().ends_with("/");
 
         let is_symlink = if entry.attribute_compatibility() == AttributeCompatibility::Unix {
             // The high two bytes of the external_file_attribute store st_mode
@@ -186,7 +190,7 @@ impl<T> HasFileType for ZipFS<T>
 where
     T: GetReader + 'static,
 {
-    type FileType = File<'static, T::R>;
+    type FileType = File<Compat<ZipEntryReader<'static, Compat<T::R>, WithoutEntry>>>;
 }
 
 impl<T> ZipFS<T>
@@ -210,7 +214,7 @@ where
             .entries
             .iter()
             .enumerate()
-            .find(|(_, entry)| path == entry.filename());
+            .find(|(_, entry)| path == entry.filename().as_str().unwrap());
 
         let (entry_idx, entry) = match found {
             Some(item) => item,
@@ -223,10 +227,11 @@ where
         };
 
         // Create a new ZipFileReader
-        let zip = ZipFileReader::from_parts(self.factory.get().await, self.zip_info.clone());
+        let zip =
+            ZipFileReader::from_raw_parts(self.factory.get().await.compat(), self.zip_info.clone());
 
         // Turn it into an entry reader
-        let inner = zip.into_entry(entry_idx).await.unwrap();
+        let inner = zip.into_entry(entry_idx).await.unwrap().compat();
 
         Ok(File {
             inner,
@@ -257,7 +262,7 @@ where
         // We don't currently support directory symlinks. This means we only need to worry about the last
         // component being a symlink. This means we can just open the file at `path` and keep following symlinks
         // until we hit a target that isn't a symlink (or doesn't exist)
-        let mut path: PathBuf = path.as_ref().into();
+        let mut path: PathBuf = path.as_ref().to_owned();
         let mut visited = HashSet::new();
         loop {
             // Normalize the path
@@ -325,7 +330,7 @@ where
             .entries
             .iter()
             .filter_map(|entry| {
-                let file_path = PathBuf::from(entry.filename());
+                let file_path = PathBuf::from(entry.filename().as_str().unwrap());
                 if file_path.starts_with(&base_path) {
                     Some(file_path)
                 } else {
