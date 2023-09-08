@@ -341,15 +341,28 @@ where
 
     async fn read_link(&self, path: impl PathType) -> Result<PathBuf> {
         // Open the file and check if it's a symlink
+        let path = path.as_ref();
         let mut f = self.open_no_follow_symlink(path).await?;
         let metadata = f.metadata().await?;
         if metadata.is_symlink() {
             // Read the target path
-            let mut path = String::new();
-            f.read_to_string(&mut path).await?;
+            let mut target = String::new();
+            f.read_to_string(&mut target).await?;
 
-            // Note: we do not normalize the path here
-            Ok(path.into())
+            // We only support symlinks that are relative paths
+            if target.starts_with("/") {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Tried to read a symlink with an absolute target, but these are not supported in ZipFS",
+                ))
+            } else {
+                // The symlink target is relative to the parent dir of the input path
+                let target = path.parent().unwrap().join(target);
+
+                // Normalize the final path
+                let target = path_clean::clean(target.as_str()).into();
+                Ok(target)
+            }
         } else {
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -414,9 +427,7 @@ mod tests {
     async fn test_external_symlink() {
         let zip = ZipFS::new(get_test_data_dir().join("external_symlink.zip")).await;
 
-        let symlink_target = zip.read_link("/symlink_to_etc_passwd").await.unwrap();
-        assert_eq!(symlink_target, "/etc/passwd");
-
+        assert!(zip.read_link("/symlink_to_etc_passwd").await.is_err());
         assert!(zip.open("/symlink_to_etc_passwd").await.is_err())
     }
 
@@ -437,12 +448,12 @@ mod tests {
 
         assert!(zip.metadata("a/a.txt").await.unwrap().is_file());
         assert!(zip.symlink_metadata("a/a.txt").await.unwrap().is_file());
-        assert_eq!(zip.read_link("a/b.txt").await.unwrap(), "a.txt");
-        assert_eq!(zip.read_link("a/c.txt").await.unwrap(), "./a.txt");
-        assert_eq!(zip.read_link("a/d.txt").await.unwrap(), "../a/a.txt");
+        assert_eq!(zip.read_link("a/b.txt").await.unwrap(), "a/a.txt");
+        assert_eq!(zip.read_link("a/c.txt").await.unwrap(), "a/a.txt");
+        assert_eq!(zip.read_link("a/d.txt").await.unwrap(), "a/a.txt");
         assert_eq!(
             zip.read_link("b/c/symlink_to_a.txt").await.unwrap(),
-            "../../a/a.txt"
+            "a/a.txt"
         );
 
         assert!(zip.metadata("b/c/d.txt").await.unwrap().is_file());
@@ -457,11 +468,11 @@ mod tests {
         );
         assert_eq!(
             zip.read_link("b/symlink_to_d.txt").await.unwrap(),
-            "c/d.txt"
+            "b/c/d.txt"
         );
         assert_eq!(
             zip.read_link("b/./symlink_to_d.txt").await.unwrap(),
-            "c/d.txt"
+            "b/c/d.txt"
         );
 
         assert_eq!(read_file(&zip, "a/a.txt").await, "a");
