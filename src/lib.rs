@@ -331,10 +331,13 @@ where
     }
 
     async fn read(&self, path: impl PathType) -> Result<Vec<u8>> {
-        let mut v = Vec::new();
-
         // Note: `open` follows the symlink chain (if any)
-        let _ = self.open(path).await?.read_to_end(&mut v).await?;
+        let mut f = self.open(path).await?;
+
+        // Get the length and read the whole file
+        let len = f.metadata().await?.len();
+        let mut v = vec![0; len as _];
+        let _ = f.read_exact(&mut v).await?;
         Ok(v)
     }
 
@@ -398,9 +401,13 @@ where
     }
 
     async fn read_to_string(&self, path: impl PathType) -> Result<String> {
-        let mut s = String::new();
-        // Note: `open` follows the symlink chain (if any)
-        let _ = self.open(path).await?.read_to_string(&mut s).await?;
+        let data = self.read(path).await?;
+        let s = String::from_utf8(data).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "File did not contain valid UTF-8",
+            )
+        })?;
         Ok(s)
     }
 
