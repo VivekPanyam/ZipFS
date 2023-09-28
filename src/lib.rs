@@ -26,8 +26,10 @@ use lunchbox::types::{
 use lunchbox::{types::PathType, ReadableFileSystem};
 use pin_project::pin_project;
 use std::collections::HashSet;
+use std::future::Future;
 use std::io::{ErrorKind, Result};
 use std::ops::Deref;
+use std::pin::Pin;
 use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
@@ -95,8 +97,14 @@ where
 pub struct File<R> {
     entry: ZipEntry,
 
+    #[cfg(not(target_family = "wasm"))]
+    loader: Pin<Box<dyn Future<Output = R> + Send + Sync>>,
+
+    #[cfg(target_family = "wasm")]
+    loader: Pin<Box<dyn Future<Output = R>>>,
+
     #[pin]
-    inner: R,
+    inner: Option<R>,
 }
 
 // Pass reads through
@@ -105,11 +113,23 @@ where
     R: AsyncRead + Unpin,
 {
     fn poll_read(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        self.project().inner.poll_read(cx, buf)
+        // Lazy load the reader
+        if self.inner.is_none() {
+            match self.loader.as_mut().poll(cx) {
+                Poll::Ready(r) => self.inner = Some(r),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        self.project()
+            .inner
+            .as_pin_mut()
+            .unwrap()
+            .poll_read(cx, buf)
     }
 }
 
@@ -230,11 +250,12 @@ where
         let zip =
             ZipFileReader::from_raw_parts(self.factory.get().await.compat(), self.zip_info.clone());
 
-        // Turn it into an entry reader
-        let inner = zip.into_entry(entry_idx).await.unwrap().compat();
-
         Ok(File {
-            inner,
+            inner: None,
+            loader: Box::pin(async move {
+                // Turn it into an entry reader
+                zip.into_entry(entry_idx).await.unwrap().compat()
+            }),
             entry: entry.clone(),
         })
     }
